@@ -1,1 +1,2 @@
-pip install requests beautifulsoup4
+requests
+beautifulsoup4
