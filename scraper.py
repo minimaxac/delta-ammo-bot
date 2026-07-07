@@ -388,7 +388,7 @@ def estimate_data_days(all_history):
 # ============================================
 GRADE_ICON = {3: "🔵", 4: "🟣", 5: "🟡"}
 PROFIT_ICONS = {">500": "🔥", ">200": "💰", ">0": "📈"}
-BAR = "▔" * 14
+BAR = "▔" * 24
 
 def short_name(name, max_len=20):
     """截断长子弹名适配手机窄屏"""
