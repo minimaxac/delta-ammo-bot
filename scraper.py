@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-三角洲子弹导购小助手 v3.0 — GitHub Actions 版
+三角洲子弹导购小助手 v4.0 — GitHub Actions 版
 =============================================
-功能:
-  1. 双源采集 (orzice 主 + deltaforcetools 副)
-  2. 源切换验证 (存活检测 + 历史偏差对比)
-  3. 赛季子弹过滤 + 分层预测引擎
-  4. CSV 时序存储 + COS 备份
-  5. 每日22:00 Server酱微信推送
+数据源: orzice.com (SSR HTML, 与游戏交易行一致)
+预测: 仅用自采 CSV 数据, 去尾淘汰 30%, 不用任何外部参考
+采集: 热时段 11-23 每5分, 冷时段 23-11 每10分, 全部 +1 分错峰
+推送: 每日 22:00 Server酱 → 微信
 
 用法: python scraper.py [--push]
-  --push  强制推送日报 (测试用, 否则只在22:00推送)
 """
-import requests, csv, json, os, re, sys
+import requests, csv, os, sys, re
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -22,63 +19,52 @@ from collections import defaultdict
 # ============================================
 SENDKEY = os.environ.get("SENDKEY", "")
 CSV_FILE = "ammo_prices.csv"
-MIN_ITEMS = 45          # 最少子弹数, 少于说明源挂了
-MAX_PRICE_DEV = 0.50   # 与昨天同比最大偏差, 超50%判可疑
+MIN_ITEMS = 35  # 过滤赛季子弹后约40-45颗常规弹
+MAX_PRICE_DEV = 0.50
 TZ_CN = timezone(timedelta(hours=8))
-
-# 赛季子弹黑名单
-BLACK_METHOD = {"特勤处回收"}
-BLACK_IDS = {1281, 1292}
-TARGET_GRADES = {3, 4, 5}
-
-# 预测参数
+TRIM_RATE = 0.30       # 去尾淘汰 30%
+MIN_DAYS_PREDICT = 14  # 至少 14 天数据才做买入预测
 FEE = {3: 0.85, 4: 0.85, 5: 0.88}
-PROFIT_MIN = 50
 GRADE_CN = {3: "3级弹", 4: "4级弹", 5: "5级弹"}
 WEEKDAY_CN = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
 
+# ============================================
+# 赛季限定子弹黑名单 (S7-S10 全部 + 过期变种)
+# ============================================
+BLACK_METHOD = {"特勤处回收"}
+
+SEASON_NAMES = {
+    # S10 赛季限定
+    "9x19mm CT", ".45 ACP CT",
+    "6.8x51mm PLY-I", "6.8x51mm PLY-II", "6.8x51mm PLY-III",
+    "5.8x42mm DBP10+P", "5.8x42mm DVC12+P",
+    "9x39mm PAB-7", "9x39mm PAB-9",
+    # 过期赛季限定变种
+    "5.56x45mm M855A1 APC+", "5.45x39mm BS ST+",
+}
+
+# ============================================
+# 等级推测 (副源用, 主源从 HTML data-grade 读)
+# ============================================
 def guess_grade(name):
-    """推测子弹等级 (副源用, 主源从 HTML data-grade 读)"""
     if "_5" in name: return 5
     if "_4" in name: return 4
     if "_3" in name: return 3
     if "AP-20" in name: return 4
-    for kw in ["M62","M995","SS190","Hybrid","DVC12","FTX","穿甲箭","PLY-III","AP SX"]:
+    for kw in ["M62","M995","SS190","Hybrid","DVC12","FTX","穿甲箭","PLY-III","AP SX","PS12B"]:
         if kw in name: return 5
     for kw in ["M80","M855A1","SS193","DBP10","FMJ SX","LPS","SP6","PBP","刺骨箭","龙息弹","PS12 ","PD12"]:
         if kw in name: return 4
+    for kw in ["PLY-II","PAB-9"]:
+        if kw in name: return 4
+    for kw in ["PLY-I","PAB-7"]:
+        if kw in name: return 3
     return 3
 
 # ============================================
-# orzice 历史参考数据集 (本地扒取, 2026-07-07)
-# ============================================
-ORZICE_REF = {
-    "12.7x55mm PS12A": {"swing":1.27}, "45-70 Govt RN": {"swing":1.05},
-    ".300BLK_3": {"swing":1.14}, ".300BLK_4": {"swing":1.12},
-    ".300BLK_5": {"swing":1.05}, ".357 Magnum JHP": {"swing":1.38},
-    ".45 ACP FMJ": {"swing":1.17}, "12 Gauge 箭形弹": {"swing":1.36},
-    "5.45x39mm PS": {"swing":1.38}, "5.56x45mm M855": {"swing":1.12},
-    "5.7x28mm L191": {"swing":1.27}, "5.7x28mm R37.F": {"swing":1.24},
-    "5.8x42mm DVP88": {"swing":1.23}, "7.62x39mm PS": {"swing":1.32},
-    "7.62x51mm BPZ": {"swing":1.20}, "9x19mm AP6.3": {"swing":1.15},
-    "9x39mm SP5": {"swing":1.41}, "玻纤柳叶箭矢": {"swing":1.18},
-    "12 Gauge 龙息弹": {"swing":1.42}, "12 Gauge独头 AP-20": {"swing":1.39},
-    "5.45x39mm BT": {"swing":1.05}, "5.56x45mm M855A1": {"swing":1.06},
-    "7.62x39mm BP": {"swing":1.27}, "9x39mm SP6": {"swing":1.07},
-    "5.8x42mm DVC12": {"swing":1.05}, "7.62x39mm AP": {"swing":1.05},
-    "9x39mm BP": {"swing":1.05}, "6.8x51mm PLY-I": {"swing":1.82},
-    "6.8x51mm PLY-III": {"swing":1.10}, "6.8x51mm FMJ": {"swing":1.05},
-    "6.8x51mm Hybrid": {"swing":1.05}, "12.7x55mm PD12双头弹": {"swing":1.06},
-    "5.7x28mm SS193": {"swing":1.04}, "5.8x42mm DBP10": {"swing":1.16},
-    "7.62x54R LPS": {"swing":1.14}, "7.62x51mm M80": {"swing":1.05},
-}
-GRADE_FALLBACK_SWING = {3: 1.25, 4: 1.15, 5: 1.08}
-
-# ============================================
-# 采集模块: orzice (主源)
+# 采集: orzice (主源, SSR HTML)
 # ============================================
 def scrape_orice():
-    """从 orzice.com 采集子弹价格"""
     items = []
     for page in range(1, 8):
         try:
@@ -95,319 +81,312 @@ def scrape_orice():
 
                 if not name_el or not price_el:
                     continue
-
                 name = name_el.text.strip()
                 method = method_el.text.strip() if method_el else ""
                 try:
                     price = int(price_el.text.strip().replace(",", ""))
                 except ValueError:
                     continue
+                if price <= 0:
+                    continue
 
-                # 提取等级 (来自 data-grade 属性)
                 grade = 0
                 if img_el and img_el.get("data-grade"):
-                    try:
-                        grade = int(img_el["data-grade"])
-                    except ValueError:
-                        pass
-
-                # 如果能识别出等级但不是3/4/5，跳过
-                if grade > 0 and grade not in TARGET_GRADES:
-                    continue
+                    try: grade = int(img_el["data-grade"])
+                    except ValueError: pass
 
                 # 过滤
-                if method in BLACK_METHOD:
-                    continue
+                if method in BLACK_METHOD: continue
+                if name in SEASON_NAMES: continue
+                if grade > 0 and grade not in (3, 4, 5): continue
 
-                items.append({"name": name, "price": price, "grade": grade if grade > 0 else guess_grade(name), "source": "orzice"})
-
+                items.append({
+                    "name": name,
+                    "price": price,
+                    "grade": grade if grade > 0 else guess_grade(name),
+                    "source": "orzice"
+                })
         except Exception as e:
-            print(f"  orzice p{page} 失败: {e}")
-
+            print(f"  orzice p{page}: {e}")
     return items
 
 # ============================================
-# 采集模块: deltaforcetools (副源)
+# 采集: deltaforcetools (副源, SSR 表格)
 # ============================================
 def scrape_deltaforce():
-    """从 deltaforcetools.gg 采集子弹价格"""
     items = []
     for page in range(1, 10):
         try:
             url = "https://deltaforcetools.gg/auction-house/ammo"
-            if page > 1:
-                url += f"?page={page}"
+            if page > 1: url += f"?page={page}"
             resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            rows = soup.select("table tbody tr")
-            if not rows:
-                rows = soup.select("tr")
-
+            rows = soup.select("table tbody tr") or soup.select("tr")
             page_items = 0
             for row in rows:
                 cols = row.find_all("td")
-                if len(cols) < 3:
-                    continue
+                if len(cols) < 3: continue
                 name = cols[1].get_text(strip=True) if len(cols) > 1 else ""
                 price_text = cols[2].get_text(strip=True) if len(cols) > 2 else ""
-                if not name or not price_text:
-                    continue
-                try:
-                    price = int(float(price_text.replace(",", "").replace("$", "")))
-                except ValueError:
-                    continue
-                if price <= 0:
-                    continue
+                if not name or not price_text: continue
+                try: price = int(float(price_text.replace(",","").replace("$","")))
+                except ValueError: continue
+                if price <= 0: continue
+                if name in SEASON_NAMES: continue
 
-                # deltaforce 的等级通过名称猜测
                 grade = guess_grade(name)
-                if grade not in TARGET_GRADES:
-                    continue
-
+                if grade not in (3, 4, 5): continue
                 items.append({"name": name, "price": price, "grade": grade, "source": "deltaforce"})
                 page_items += 1
 
-            if page_items == 0:
-                break  # 空页，停止
-
+            if page_items == 0: break
         except Exception as e:
-            print(f"  deltaforce p{page} 失败: {e}")
+            print(f"  deltaforce p{page}: {e}")
             break
-
     return items
 
 # ============================================
-# 采集入口: 双源 + 验证
+# 采集入口: 双源 + 验证 + 切换
 # ============================================
 def fetch_prices():
-    """双源采集, 带切换验证"""
     now = datetime.now(TZ_CN)
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
     collected = []
 
-    # 先读昨天数据(用于偏差对比)
-    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
-
-    # --- 主源 ---
     print("[采集] 主源 orzice...")
     items1 = scrape_orice()
-    ok, reason = validate_source(items1, "orzice", yesterday)
+    ok, reason = validate_source(items1, yesterday)
     if ok:
         collected = items1
-        print(f"  ✅ orzice: {len(items1)} 种子弹, 验证通过")
+        print(f"  ✅ orzice: {len(items1)} 种子弹")
     else:
-        print(f"  ❌ orzice 不可用: {reason}")
-
-    # --- 副源 ---
-    if not collected:
+        print(f"  ❌ orzice: {reason}")
         print("[采集] 副源 deltaforcetools...")
         items2 = scrape_deltaforce()
-        ok, reason = validate_source(items2, "deltaforce", yesterday)
+        ok, reason = validate_source(items2, yesterday)
         if ok:
             collected = items2
-            print(f"  ⚠️ 切换到 deltaforce: {len(items2)} 种子弹")
+            print(f"  ⚠️ deltaforce: {len(items2)} 种")
         else:
-            print(f"  ❌ deltaforce 也不可用: {reason}")
+            print(f"  ❌ deltaforce: {reason}")
+            fallback = load_fallback()
+            if fallback:
+                collected = fallback
+                print(f"  🆘 CSV快照: {len(collected)} 种")
+            else:
+                print("  💀 全部失效")
+                return {"timestamp": now.strftime("%Y-%m-%d %H:%M"), "total": 0, "items": []}
 
-    # --- 兜底: 读 CSV 最后一行 ---
-    if not collected:
-        fallback = load_fallback()
-        if fallback:
-            collected = fallback
-            print(f"  🆘 双源失效, 使用 CSV 快照: {len(collected)} 种子弹")
-        else:
-            print("  💀 全部失效, 无数据可用")
+    return {"timestamp": now.strftime("%Y-%m-%d %H:%M"), "total": len(collected), "items": collected}
 
-    # 补充等级信息(从名字推测, orzice 没直接给等级)
-    for it in collected:
-        if "grade" not in it:
-            it["grade"] = guess_grade(it["name"])
-
-    # 过滤: 只保留 Lv.3/4/5
-    collected = [it for it in collected if it.get("grade", 0) in TARGET_GRADES]
-
-    return {
-        "timestamp": now.strftime("%Y-%m-%d %H:%M"),
-        "total": len(collected),
-        "items": collected,
-    }
-
-def validate_source(items, source_name, yesterday_ref):
-    """源验证: 存活检测 + 偏差对比"""
+def validate_source(items, yesterday_ref):
     if not items or len(items) < MIN_ITEMS:
         return False, f"数量不足({len(items)}<{MIN_ITEMS})"
-
-    # 检查空值比例
     zero_count = sum(1 for it in items if it["price"] <= 0)
     if zero_count > len(items) * 0.2:
         return False, f"空值过多({zero_count}/{len(items)})"
-
-    # 简单历史偏差对比: 抽查5颗常见子弹
-    check_names = ["7.62x39mm PS", "5.45x39mm PS", "9x19mm AP6.3",
-                   ".45 ACP FMJ", "12 Gauge独头 AP-20"]
+    # 抽查 5 颗与昨日同比
+    check = ["7.62x39mm PS", "5.45x39mm PS", "9x19mm AP6.3", ".45 ACP FMJ", "12 Gauge独头 AP-20"]
     suspicious = 0
-    for name in check_names:
+    for name in check:
         found = [it for it in items if it["name"] == name]
-        if not found:
-            continue
-        today_price = found[0]["price"]
-
-        # 读昨天同时段价格
-        yesterday_price = get_yesterday_price(name, yesterday_ref)
-        if yesterday_price and yesterday_price > 0:
-            dev = abs(today_price - yesterday_price) / max(today_price, yesterday_price)
-            if dev > MAX_PRICE_DEV:
-                suspicious += 1
-                print(f"    ⚠️ {name}: 今天{today_price} vs 昨天~{yesterday_price} 偏差{dev:.0%}")
-
-    if suspicious >= 3:  # 3颗以上异常
-        return False, f"价格偏差过大(sus={suspicious}/5)"
-
+        if not found: continue
+        today_p = found[0]["price"]
+        yesterday_p = get_yesterday_price(name, yesterday_ref)
+        if yesterday_p and yesterday_p > 0:
+            dev = abs(today_p - yesterday_p) / max(today_p, yesterday_p)
+            if dev > MAX_PRICE_DEV: suspicious += 1
+    if suspicious >= 3: return False, f"价格偏差过大({suspicious})"
     return True, "ok"
 
 def get_yesterday_price(name, ref_time):
-    """从 CSV 读昨天同时间约的价格"""
-    if not os.path.exists(CSV_FILE):
-        return None
+    if not os.path.exists(CSV_FILE): return None
     try:
         with open(CSV_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-            if not rows:
-                return None
-            # 找最接近的昨天记录
+            rows = list(csv.DictReader(f))
             for row in reversed(rows):
                 ts = row.get("timestamp", "")
-                if ref_time[:10] in ts:  # 同一天
-                    val = row.get(name, "")
-                    try:
-                        return int(float(val))
-                    except (ValueError, TypeError):
-                        pass
-            return None
-    except Exception:
-        return None
+                if ref_time[:10] in ts:
+                    v = row.get(name, "")
+                    try: return int(float(v))
+                    except: pass
+    except: pass
+    return None
 
 def load_fallback():
-    """从 CSV 读最后一行作为兜底"""
-    if not os.path.exists(CSV_FILE):
-        return None
+    if not os.path.exists(CSV_FILE): return None
     try:
         with open(CSV_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-            if not rows:
-                return None
-            last = rows[-1]
-            items = []
-            for name, price_str in last.items():
-                if name == "timestamp":
-                    continue
-                try:
-                    price = int(float(price_str))
-                    if price > 0:
-                        items.append({"name": name, "price": price, "source": "fallback"})
-                except (ValueError, TypeError):
-                    pass
-            return items if len(items) >= MIN_ITEMS else None
-    except Exception:
-        return None
+            rows = list(csv.DictReader(f))
+            if not rows: return None
+        last = rows[-1]
+        items = []
+        for name, price_str in last.items():
+            if name == "timestamp": continue
+            try:
+                p = int(float(price_str))
+                if p > 0: items.append({"name": name, "price": p, "grade": guess_grade(name), "source": "fallback"})
+            except: pass
+        return items if len(items) >= MIN_ITEMS else None
+    except: return None
 
 # ============================================
 # 存储: CSV 时序
 # ============================================
 def save_csv(items, timestamp):
-    """存储到 CSV 时间序列"""
-    # 生成新行
     row = {"timestamp": timestamp}
     for it in items:
         row[it["name"]] = it["price"]
 
-    # 读现有 CSV
+    existing = []
     if os.path.exists(CSV_FILE):
         with open(CSV_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            existing = list(reader)
-    else:
-        existing = []
+            existing = list(csv.DictReader(f))
 
-    # 收集所有列名
     all_cols = set()
-    if existing:
-        all_cols.update(existing[0].keys())
+    if existing: all_cols.update(existing[0].keys())
     all_cols.update(row.keys())
     cols = ["timestamp"] + sorted(c for c in all_cols if c != "timestamp")
 
-    # 追加并写回
     existing.append(row)
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()
         for r in existing:
             writer.writerow(r)
-
-    print(f"  CSV 已保存: {len(existing)} 行")
+    print(f"  CSV: {len(existing)} 行")
 
 # ============================================
-# 分析: 预测引擎
+# 分析: 纯自采数据预测引擎
 # ============================================
-def analyze(items):
-    """买入建议分析"""
+def load_all_prices():
+    """加载CSV中所有子弹的时序价格, 返回 {name: [(datetime, price), ...]}"""
+    if not os.path.exists(CSV_FILE):
+        return {}
+    data = defaultdict(list)
+    with open(CSV_FILE, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            ts = row.get("timestamp", "")
+            try:
+                dt = datetime.strptime(ts, "%Y-%m-%d %H:%M")
+            except ValueError:
+                continue
+            for name, price_str in row.items():
+                if name == "timestamp": continue
+                if not price_str: continue
+                try:
+                    p = int(float(price_str))
+                    if p > 0:
+                        data[name].append((dt, p))
+                except (ValueError, TypeError):
+                    pass
+
+    # 按时间排序
+    for name in data:
+        data[name].sort(key=lambda x: x[0])
+    return data
+
+def get_period_prices(history, current_dt, days=14):
+    """从历史数据中取最近 N 天的价格, 按工作日/周末分类"""
+    cutoff = current_dt - timedelta(days=days)
+    weekday_prices = []
+    weekend_prices = []
+
+    for dt, price in history:
+        if dt >= cutoff:
+            # Python weekday(): 0=Mon .. 4=Fri, 5=Sat, 6=Sun
+            if dt.weekday() >= 5:
+                weekend_prices.append(price)
+            else:
+                weekday_prices.append(price)
+
+    return weekday_prices, weekend_prices
+
+def trim_tail_avg(prices):
+    """去尾淘汰法: 弃最低 TRIM_RATE% 条数据, 剩余取平均"""
+    if not prices:
+        return None
+    sorted_p = sorted(prices)
+    trim_n = max(1, int(len(sorted_p) * TRIM_RATE))
+    kept = sorted_p[trim_n:]
+    return round(sum(kept) / len(kept)) if kept else None
+
+def analyze(items, now=None):
+    """买入建议分析 — 仅用自采CSV数据"""
+    if now is None:
+        now = datetime.now(TZ_CN)
+
+    all_history = load_all_prices()
+    total_days = estimate_data_days(all_history)
+
     buys = []
     for it in items:
         name = it["name"]
         grade = it.get("grade", 3)
         price = it["price"]
+        history = all_history.get(name, [])
 
-        # 周末波动比
-        ref = ORZICE_REF.get(name, {})
-        swing = ref.get("swing", GRADE_FALLBACK_SWING.get(grade, 1.10))
-        swing = max(1.05, min(2.0, swing))
+        if not history or total_days < 3:
+            # 数据太少, 跳过
+            continue
 
-        predicted = int(price * swing)
-        profit = round(predicted * FEE.get(grade, 0.85) - price)
+        weekday_p, weekend_p = get_period_prices(history, now, days=14)
 
-        # 历史最低参考
-        history_prices = get_history_prices(name)
-        week_low = min(history_prices) if history_prices else price
+        # 周末均价 (去尾淘汰)
+        weekend_avg = trim_tail_avg(weekend_p) if weekend_p else None
+
+        # 工作日均价
+        weekday_avg = round(sum(weekday_p) / len(weekday_p)) if weekday_p else price
+
+        # 周内最低参考
+        week_low = min(weekday_p) if weekday_p else price
+
+        # 预期利润
+        if weekend_avg and weekend_avg > 0:
+            predicted = weekend_avg
+        elif weekday_avg:
+            # 没有周末数据时, 不做预测
+            predicted = None
+        else:
+            predicted = None
+
         gain_pct = round((price - week_low) / week_low * 100, 1) if week_low > 0 else 0
 
-        if profit > PROFIT_MIN:
+        if predicted:
+            profit = round(predicted * FEE.get(grade, 0.85) - price)
+
+            # 只在利润 > 0 时加入买入建议
+            if profit > 0:
+                buys.append({
+                    "name": name, "grade": grade, "price": price,
+                    "predicted": predicted, "profit": profit,
+                    "gain_pct": gain_pct, "week_low": week_low,
+                })
+        else:
+            # 数据不足, 只记录行情
             buys.append({
                 "name": name, "grade": grade, "price": price,
-                "predicted": predicted, "profit": profit,
+                "predicted": 0, "profit": 0,
                 "gain_pct": gain_pct, "week_low": week_low,
             })
 
     buys.sort(key=lambda x: x["profit"], reverse=True)
-    return buys
+    return buys, total_days
 
-def get_history_prices(name):
-    """从 CSV 取该子弹历史价格"""
-    prices = []
-    if not os.path.exists(CSV_FILE):
-        return prices
-    try:
-        with open(CSV_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                val = row.get(name, "")
-                try:
-                    p = int(float(val))
-                    if p > 0:
-                        prices.append(p)
-                except (ValueError, TypeError):
-                    pass
-    except Exception:
-        pass
-    return prices[-100:]  # 最近100条
+def estimate_data_days(all_history):
+    """估算数据覆盖了多少天"""
+    all_times = set()
+    for history in all_history.values():
+        for dt, _ in history:
+            all_times.add(dt.date())
+    return max(1, len(all_times))
 
 # ============================================
-# 推送: Server酱微信
+# 推送: Server酱微信日报
 # ============================================
-def push_report(buys, total, timestamp):
-    """推送微信日报"""
+def push_report(buys, total, timestamp, total_days):
     if not SENDKEY:
         print("[推送] 跳过, 未设置 SENDKEY")
         return
@@ -416,35 +395,49 @@ def push_report(buys, total, timestamp):
     wd = WEEKDAY_CN.get(now.weekday(), "")
     title = f"三角洲子弹导购 {now.strftime('%m/%d')} {wd}"
 
-    if now.weekday() in (0, 1):
-        tip = "> 周初低价窗口，以下为周末预期利润 Top 10"
-    elif now.weekday() in (2, 3):
-        tip = "> 价格已上行，以下为周末预期利润 Top 10"
-    elif now.weekday() == 4:
-        tip = "> 周五已近峰值，注意区分已涨 vs 预期再涨空间"
+    # 三阶段日报
+    profit_buys = [b for b in buys if b["profit"] > 0]
+    profit_buys.sort(key=lambda x: x["profit"], reverse=True)
+
+    if total_days >= MIN_DAYS_PREDICT and profit_buys:
+        tip = f"> 数据积累 {total_days} 天 | 以下为预期利润 Top 10"
     else:
-        tip = "> 周末峰值区间，可关注下周初回调机会"
+        tip = f"> 📊 行情速览 | 数据积累 {total_days}/{MIN_DAYS_PREDICT} 天, 预测功能待激活"
 
     lines = [
         f"## 三角洲子弹导购日报",
         f"**{now.strftime('%m/%d')} {wd}** | {timestamp}",
         f"常规子弹: {total} 种",
         "", tip, "",
-        "| # | 子弹 | 当前 | 周低 | 已涨 | 周末预估 | 预期利润 |",
-        "|---|------|------|------|------|----------|----------|",
     ]
 
-    if buys:
-        for i, b in enumerate(buys[:10], 1):
+    if total_days >= MIN_DAYS_PREDICT and profit_buys:
+        # 阶段 3: 完整预测
+        lines += [
+            "| # | 子弹 | 当前 | 周低 | 已涨 | 周末预估 | 利润 |",
+            "|---|------|------|------|------|----------|------|",
+        ]
+        for i, b in enumerate(profit_buys[:10], 1):
             g_cn = GRADE_CN.get(b["grade"], f"{b['grade']}级弹")
             gain = f"+{b['gain_pct']}%" if b['gain_pct'] >= 0 else f"{b['gain_pct']}%"
             lines.append(
                 f"| {i} | {g_cn} {b['name']} | {b['price']} | "
                 f"{b['week_low']} | {gain} | {b['predicted']} | **+{b['profit']}** |")
     else:
-        lines.append("| - | 暂无满足条件的买入信号 | - | - | - | - | - |")
+        # 阶段 1-2: 行情 + 趋势
+        trend_buys = sorted(buys, key=lambda x: x["gain_pct"], reverse=True)
+        lines += [
+            "| # | 子弹 | 当前 | 周低 | 涨跌% |",
+            "|---|------|------|------|-------|",
+        ]
+        for i, b in enumerate(trend_buys[:10], 1):
+            g_cn = GRADE_CN.get(b["grade"], f"{b['grade']}级弹")
+            gain = f"+{b['gain_pct']}%" if b['gain_pct'] >= 0 else f"{b['gain_pct']}%"
+            lines.append(
+                f"| {i} | {g_cn} {b['name']} | {b['price']} | "
+                f"{b['week_low']} | {gain} |")
 
-    lines += ["", "> 利润=周末预估×手续费−买入价 | 数据: orzice | v3.0"]
+    lines += ["", "> 数据源: orzice | 仅自采数据预测 | v4.0"]
 
     body = {"title": title, "desp": "\n".join(lines)}
     try:
@@ -461,11 +454,10 @@ def main():
     force_push = "--push" in sys.argv
 
     print("=" * 50)
-    print("Delta Ammo Bot v3.0 (GitHub Actions)")
-    print(f"启动时间: {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}")
+    print("Delta Ammo Bot v4.0 (GitHub Actions)")
+    print(f"启动: {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
 
-    # 1. 采集
     data = fetch_prices()
     if data["total"] == 0:
         print("[失败] 无数据")
@@ -475,27 +467,25 @@ def main():
     ts = data["timestamp"]
     print(f"  有效: {len(items)} 种子弹")
 
-    # 2. 存储
-    print("[存储] 写入 CSV...")
+    print("[存储] CSV...")
     save_csv(items, ts)
 
-    # 3. 分析
     print("[分析] 预测引擎...")
-    buys = analyze([it for it in items if it.get("grade", 0) in TARGET_GRADES])
-    print(f"  买入建议: {len(buys)} 种")
-
-    # 4. 推送
     now = datetime.now(TZ_CN)
-    if force_push or now.hour == 22:
-        print("[推送] 发送日报...")
-        push_report(buys, len(items), ts)
-    else:
-        print(f"[跳过] 非推送时段 ({now.hour}时)")
+    buys, total_days = analyze(items, now)
+    profit_buys = [b for b in buys if b["profit"] > 0]
+    print(f"  数据覆盖: {total_days} 天 | 买入建议: {len(profit_buys)} 种")
 
-    # 摘要
-    for b in buys[:5]:
+    hour = now.hour
+    if force_push or hour == 22:
+        print("[推送] 日报...")
+        push_report(buys, len(items), ts, total_days)
+    else:
+        print(f"[跳过] 非推送时段 ({hour}时)")
+
+    for b in (profit_buys[:5] if profit_buys else buys[:5]):
         print(f"  {GRADE_CN.get(b['grade'])} {b['name']}: "
-              f"买入{b['price']} 利润+{b['profit']}")
+              f"买入{b['price']} 利润+{b['profit']} 已涨{b['gain_pct']:+.1f}%")
 
     print("=" * 50)
     print("完成")
