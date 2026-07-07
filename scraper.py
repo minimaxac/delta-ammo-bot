@@ -388,7 +388,7 @@ def estimate_data_days(all_history):
 # ============================================
 GRADE_ICON = {3: "🟢", 4: "🟡", 5: "🔴"}
 PROFIT_ICONS = {">500": "🔥", ">200": "💰", ">0": "📈"}
-BAR = "▔" * 32
+BAR = "▔" * 24
 
 def push_report(buys, total, timestamp, total_days):
     if not SENDKEY:
@@ -409,7 +409,8 @@ def push_report(buys, total, timestamp, total_days):
         f"**🔥 三角洲子弹导购 · {date_str} {wd}**",
         "",
         f"📅 {date_str} {wd}  ⏰ {timestamp}",
-        f"🎯 常规子弹 {total} 种  📈 数据 {total_days}/{MIN_DAYS_PREDICT} 天"
+        f"🎯 常规子弹 {total} 种",
+        f"📈 数据 {total_days}/{MIN_DAYS_PREDICT} 天"
         f"{' ✅' if ready else ' ⏳'}",
         "",
         BAR,
