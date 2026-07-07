@@ -384,8 +384,12 @@ def estimate_data_days(all_history):
     return max(1, len(all_times))
 
 # ============================================
-# 推送: Server酱微信日报
+# 推送: Server酱微信日报 v4.1 视觉增强版
 # ============================================
+GRADE_ICON = {3: "🟢", 4: "🟡", 5: "🔴"}
+PROFIT_ICONS = {">500": "🔥", ">200": "💰", ">0": "📈"}
+BAR = "▔" * 32
+
 def push_report(buys, total, timestamp, total_days):
     if not SENDKEY:
         print("[推送] 跳过, 未设置 SENDKEY")
@@ -393,53 +397,119 @@ def push_report(buys, total, timestamp, total_days):
 
     now = datetime.now(TZ_CN)
     wd = WEEKDAY_CN.get(now.weekday(), "")
-    title = f"三角洲子弹导购 {now.strftime('%m/%d')} {wd}"
+    date_str = now.strftime("%m/%d")
 
-    # 三阶段日报
     profit_buys = [b for b in buys if b["profit"] > 0]
     profit_buys.sort(key=lambda x: x["profit"], reverse=True)
 
-    if total_days >= MIN_DAYS_PREDICT and profit_buys:
-        tip = f"> 数据积累 {total_days} 天 | 以下为预期利润 Top 10"
-    else:
-        tip = f"> 📊 行情速览 | 数据积累 {total_days}/{MIN_DAYS_PREDICT} 天, 预测功能待激活"
+    ready = total_days >= MIN_DAYS_PREDICT
 
-    lines = [
-        f"## 三角洲子弹导购日报",
-        f"**{now.strftime('%m/%d')} {wd}** | {timestamp}",
-        f"常规子弹: {total} 种",
-        "", tip, "",
+    # ─── 日报头 ───
+    header = [
+        f"**🔥 三角洲子弹导购 · {date_str} {wd}**",
+        "",
+        f"📅 {date_str} {wd}  ⏰ {timestamp}",
+        f"🎯 常规子弹 {total} 种  📈 数据 {total_days}/{MIN_DAYS_PREDICT} 天"
+        f"{' ✅' if ready else ' ⏳'}",
+        "",
+        BAR,
+        "",
     ]
 
-    if total_days >= MIN_DAYS_PREDICT and profit_buys:
-        # 阶段 3: 完整预测
-        lines += [
+    # ─── 日内行情摘要 ───
+    if buys:
+        prices = [b["price"] for b in buys]
+        avg_p = sum(prices) // len(prices)
+        max_b = max(buys, key=lambda x: x["price"])
+        min_b = min(buys, key=lambda x: x["price"])
+        up_n = sum(1 for b in buys if b["gain_pct"] > 0)
+        down_n = sum(1 for b in buys if b["gain_pct"] < 0)
+
+        summary = [
+            f"📊 **行情摘要**",
+            f"均价 {avg_p}  |  📈{up_n}涨 📉{down_n}跌",
+            f"最高 {max_b['name']} {max_b['price']}",
+            f"最低 {min_b['name']} {min_b['price']}",
+            "",
+        ]
+    else:
+        summary = ["📊 暂无数据", ""]
+
+    # ─── 主体表格 ───
+    if ready and profit_buys:
+        # 🎯 完整预测模式
+        table_header = [
+            f"🎯 **买入建议 Top 10**",
+            "",
             "| # | 子弹 | 当前 | 周低 | 已涨 | 周末预估 | 利润 |",
             "|---|------|------|------|------|----------|------|",
         ]
+        table_rows = []
         for i, b in enumerate(profit_buys[:10], 1):
+            g_icon = GRADE_ICON.get(b["grade"], "⚪")
             g_cn = GRADE_CN.get(b["grade"], f"{b['grade']}级弹")
             gain = f"+{b['gain_pct']}%" if b['gain_pct'] >= 0 else f"{b['gain_pct']}%"
-            lines.append(
-                f"| {i} | {g_cn} {b['name']} | {b['price']} | "
-                f"{b['week_low']} | {gain} | {b['predicted']} | **+{b['profit']}** |")
-    else:
-        # 阶段 1-2: 行情 + 趋势
-        trend_buys = sorted(buys, key=lambda x: x["gain_pct"], reverse=True)
-        lines += [
-            "| # | 子弹 | 当前 | 周低 | 涨跌% |",
-            "|---|------|------|------|-------|",
+            profit_icon = "🔥" if b["profit"] > 300 else ("💰" if b["profit"] > 100 else "📈")
+
+            table_rows.append(
+                f"| {i} | {g_icon}{g_cn} {b['name']} | {b['price']} | "
+                f"{b['week_low']} | {gain} | {b['predicted']} | "
+                f"{profit_icon} **+{b['profit']}** |"
+            )
+        body_lines = header + summary + table_header + table_rows + [""]
+
+    elif buys:
+        # 📊 行情速览模式 (数据不足)
+        trend_buys = sorted(buys, key=lambda x: abs(x["gain_pct"]), reverse=True)
+
+        table_header = [
+            f"📋 **行情速览 Top 10**" if not ready else f"📋 **日内波动 Top 10**",
+            f"⚠️ 数据积累中, 预测功能待 {MIN_DAYS_PREDICT - total_days} 天后激活",
+            "",
+            "| # | 子弹 | 当前 | 周低 | 涨跌 |",
+            "|---|------|------|------|------|",
         ]
+        table_rows = []
         for i, b in enumerate(trend_buys[:10], 1):
+            g_icon = GRADE_ICON.get(b["grade"], "⚪")
             g_cn = GRADE_CN.get(b["grade"], f"{b['grade']}级弹")
-            gain = f"+{b['gain_pct']}%" if b['gain_pct'] >= 0 else f"{b['gain_pct']}%"
-            lines.append(
-                f"| {i} | {g_cn} {b['name']} | {b['price']} | "
-                f"{b['week_low']} | {gain} |")
+            if b["gain_pct"] > 5:
+                arrow = "🔺"
+            elif b["gain_pct"] > 0:
+                arrow = "📈"
+            elif b["gain_pct"] < -5:
+                arrow = "🔻"
+            elif b["gain_pct"] < 0:
+                arrow = "📉"
+            else:
+                arrow = "➖"
+            gain = f"{arrow} {b['gain_pct']:+.1f}%"
+            table_rows.append(
+                f"| {i} | {g_icon}{g_cn} {b['name']} | {b['price']} | "
+                f"{b['week_low']} | {gain} |"
+            )
+        body_lines = header + summary + table_header + table_rows + [""]
 
-    lines += ["", "> 数据源: orzice | 仅自采数据预测 | v4.0"]
+    else:
+        body_lines = header + summary + ["暂无数据", ""]
 
-    body = {"title": title, "desp": "\n".join(lines)}
+    # ─── 页脚 ───
+    day_tip = {
+        0: "💡 周一低谷, 关注跌幅最大 Top 5", 1: "💡 周二筑底, 逢低关注",
+        2: "💡 周三启动, 关注涨价趋势", 3: "💡 周四加速, 谨慎追高",
+        4: "💡 周五已近峰值, 注意止盈", 5: "💡 周六高位, 可考虑出货",
+        6: "💡 周日顶峰, 等待下周回调",
+    }.get(now.weekday(), "")
+
+    footer = [
+        BAR,
+        f"{day_tip}",
+        f"📡 数据源 orzice  ⚙️ v4.1  🕐 下次推送 明晚22:00",
+    ]
+
+    lines = body_lines + footer
+    body = {"title": f"🔥 三角洲导购 {date_str} {wd}", "desp": "\n".join(lines)}
+
     try:
         url = f"https://sctapi.ftqq.com/{SENDKEY}.send"
         resp = requests.post(url, data=body, timeout=10)
