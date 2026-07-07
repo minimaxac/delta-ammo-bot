@@ -386,9 +386,15 @@ def estimate_data_days(all_history):
 # ============================================
 # 推送: Server酱微信日报 v4.1 视觉增强版
 # ============================================
-GRADE_ICON = {3: "🔵", 4: "🟣", 5: "🟤"}
+GRADE_ICON = {3: "🔵", 4: "🟣", 5: "🟡"}
 PROFIT_ICONS = {">500": "🔥", ">200": "💰", ">0": "📈"}
-BAR = "▔" * 24
+BAR = "▔" * 14
+
+def short_name(name, max_len=20):
+    """截断长子弹名适配手机窄屏"""
+    if len(name) <= max_len:
+        return name
+    return name[:max_len-2] + ".."
 
 def push_report(buys, total, timestamp, total_days):
     if not SENDKEY:
@@ -442,20 +448,17 @@ def push_report(buys, total, timestamp, total_days):
         table_header = [
             f"🎯 **买入建议 Top 10**",
             "",
-            "| # | 子弹 | 当前 | 周低 | 已涨 | 周末预估 | 利润 |",
-            "|---|------|------|------|------|----------|------|",
+            "| # | 子弹 | 买入 | 预估 | 利润 |",
+            "|---|------|------|------|------|",
         ]
         table_rows = []
         for i, b in enumerate(profit_buys[:10], 1):
             g_icon = GRADE_ICON.get(b["grade"], "⚪")
-            g_cn = GRADE_CN.get(b["grade"], f"{b['grade']}级弹")
-            gain = f"+{b['gain_pct']}%" if b['gain_pct'] >= 0 else f"{b['gain_pct']}%"
+            sname = short_name(b["name"])
             profit_icon = "🔥" if b["profit"] > 300 else ("💰" if b["profit"] > 100 else "📈")
-
             table_rows.append(
-                f"| {i} | {g_icon}{g_cn} {b['name']} | {b['price']} | "
-                f"{b['week_low']} | {gain} | {b['predicted']} | "
-                f"{profit_icon} **+{b['profit']}** |"
+                f"| {i} | {g_icon}{sname} | {b['price']} | "
+                f"{b['predicted']} | {profit_icon}+{b['profit']} |"
             )
         body_lines = header + summary + table_header + table_rows + [""]
 
@@ -473,20 +476,15 @@ def push_report(buys, total, timestamp, total_days):
         table_rows = []
         for i, b in enumerate(trend_buys[:10], 1):
             g_icon = GRADE_ICON.get(b["grade"], "⚪")
-            g_cn = GRADE_CN.get(b["grade"], f"{b['grade']}级弹")
-            if b["gain_pct"] > 5:
-                arrow = "🔺"
-            elif b["gain_pct"] > 0:
-                arrow = "📈"
-            elif b["gain_pct"] < -5:
-                arrow = "🔻"
-            elif b["gain_pct"] < 0:
-                arrow = "📉"
-            else:
-                arrow = "➖"
-            gain = f"{arrow} {b['gain_pct']:+.1f}%"
+            sname = short_name(b["name"])
+            if b["gain_pct"] > 5: arrow = "🔺"
+            elif b["gain_pct"] > 0: arrow = "📈"
+            elif b["gain_pct"] < -5: arrow = "🔻"
+            elif b["gain_pct"] < 0: arrow = "📉"
+            else: arrow = "➖"
+            gain = f"{arrow}{b['gain_pct']:+.1f}%"
             table_rows.append(
-                f"| {i} | {g_icon}{g_cn} {b['name']} | {b['price']} | "
+                f"| {i} | {g_icon}{sname} | {b['price']} | "
                 f"{b['week_low']} | {gain} |"
             )
         body_lines = header + summary + table_header + table_rows + [""]
