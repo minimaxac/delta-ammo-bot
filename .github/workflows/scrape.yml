@@ -1,0 +1,42 @@
+name: Delta Force Ammo Bot
+
+on:
+  schedule:
+    # 热时段 11:01-01:01 (UTC 03:01-17:01) 每5分钟, +1分错峰
+    - cron: '1-59/5 3-16 * * *'
+    # 温时段 08:01-11:01 (UTC 00:01-03:01) 每10分钟, +1分错峰
+    - cron: '1-59/10 0-2 * * *'
+    # 冷时段 01:01-08:01 (UTC 17:01-00:01) 每15分钟, +1分错峰
+    - cron: '1-59/15 17-23,0 * * *'
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          SENDKEY: ${{ secrets.SENDKEY }}
+        run: python scraper.py
+
+      - name: Commit CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ammo_prices.csv
+          git diff --staged --quiet || git commit -m "Update prices $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
