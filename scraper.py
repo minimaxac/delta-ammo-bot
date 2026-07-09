@@ -270,7 +270,7 @@ def load_all_prices():
         for row in csv.DictReader(f):
             ts = row.get("timestamp", "")
             try:
-                dt = datetime.strptime(ts, "%Y-%m-%d %H:%M")
+                dt = datetime.strptime(ts, "%Y-%m-%d %H:%M").replace(tzinfo=TZ_CN)
             except ValueError:
                 continue
             for name, price_str in row.items():
